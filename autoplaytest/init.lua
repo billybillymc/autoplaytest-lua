@@ -1,6 +1,4 @@
--- autoplaytest/init.lua — Entry point for the autoplaytest-lua library
---
--- Engine-agnostic automated playtesting framework for Lua games.
+-- autoplaytest/init.lua — Engine-agnostic automated playtesting for Lua games
 --
 -- Usage:
 --   local Autoplaytest = require("autoplaytest")
@@ -12,6 +10,6 @@ local Autoplaytest = {}
 Autoplaytest.Bot = require("autoplaytest.bot")
 Autoplaytest.Telemetry = require("autoplaytest.telemetry")
 
-Autoplaytest._VERSION = "0.1.0"
+Autoplaytest._VERSION = "0.2.0"
 
 return Autoplaytest

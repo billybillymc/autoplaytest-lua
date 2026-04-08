@@ -1,22 +1,21 @@
 # autoplaytest-lua
 
-Automated playtesting framework for Lua games.
+Automated playtesting framework for Lua games. Simulates human players at configurable skill levels, collects telemetry, computes batch statistics, and runs balance assertions -- useful for difficulty tuning, regression detection, and CI smoke tests.
 
-Drop in a simulated AI player that plays your game at configurable skill levels, collects telemetry, and exports per-run summaries — useful for balance testing, regression detection, and CI smoke tests.
-
-Works with any Lua game engine (LOVE2D, Defold, Solar2D, Playdate, plain Lua, etc.). Engine-specific bits (drawing, file I/O, quit) are behind overridable callbacks with sensible defaults.
+Works with any Lua game engine (LOVE2D, Defold, Solar2D, Playdate, plain Lua). Engine-specific bits (drawing, file I/O, quit) are behind overridable callbacks with sensible defaults.
 
 ## Features
 
-- **Bot framework** with configurable skill presets (low / medium / high) controlling reaction time, cursor accuracy, movement speed, and click rate
-- **Virtual cursor** with human-like jitter and movement
-- **Batch runs** — queue N automated playthroughs back-to-back
-- **Speed multiplier** — run games at 2x, 4x, 8x, 16x for fast iteration
-- **Telemetry** — structured event logging, periodic state snapshots, per-run summaries exported as Lua tables
-- **CLI support** — start bot runs from the command line for CI integration
-- **HUD overlay** — pluggable drawing callback for bot status display
-- **Keyboard controls** — toggle bot, switch skill levels, adjust speed at runtime
-- **Engine-agnostic** — zero hard dependencies on any engine; LOVE2D fallbacks provided out of the box
+- **Fitts's law cursor movement** -- acceleration/deceleration curves with occasional overshoot, not constant-speed linear movement
+- **Framerate-independent jitter** -- consistent mouse imprecision regardless of FPS (fixed 30Hz jitter tick)
+- **Skill presets** (low / medium / high) controlling reaction time, accuracy, movement speed, and click rate
+- **Phase tracking** -- generic begin/end phase pairs with automatic duration and numeric delta computation
+- **Batch statistics** -- mean, stddev, min, max across all runs for every numeric field
+- **Balance assertions** -- define pass/fail criteria per run, get exit code 1 on failure for CI
+- **Batch runs** -- queue N automated playthroughs back-to-back
+- **Speed multiplier** -- run games at 2x, 4x, 8x, 16x
+- **CLI support** -- `yourapp bot medium 10 4` for headless CI
+- **Engine-agnostic** -- zero hard dependencies; LOVE2D fallbacks provided
 
 ## Installation
 
@@ -35,9 +34,9 @@ your-game/
 Then require it:
 
 ```lua
-local Autoplaytest = require("autoplaytest")
-local Bot = Autoplaytest.Bot
-local Telemetry = Autoplaytest.Telemetry
+local APT = require("autoplaytest")
+local Bot = APT.Bot
+local T = APT.Telemetry
 ```
 
 ## Quick Start
@@ -45,32 +44,32 @@ local Telemetry = Autoplaytest.Telemetry
 ### 1. Configure the bot
 
 ```lua
--- Tell the bot about your screen size (design coordinates)
 Bot.screenW = 800
 Bot.screenH = 600
 
--- How to read current game state
+-- Return current game state. "play" triggers cursor movement + clicking.
 Bot.getState = function()
-    return Game.state  -- return "play" for active gameplay, or your state name
+    if Game.state == "combat" then return "play"
+    else return Game.state end
 end
 
--- How to find what to click during active play
+-- Return (x, y) of what to click, or nil.
 Bot.findTarget = function()
     local enemy = findClosestEnemy()
     if enemy then return enemy.x, enemy.y end
     return nil
 end
 
--- How to perform a click
+-- Dispatch a click into your game.
 Bot.onClick = function(x, y)
     Game.handleClick(x, y)
 end
 
--- How to reset for a new run
+-- Reset the game for a new run.
 Bot.onRunStart = function()
     Game.reset()
-    Telemetry.reset()
-    Telemetry.playerTag = "bot_" .. Bot.skill
+    T.reset()
+    T.playerTag = "bot_" .. Bot.skill
 end
 ```
 
@@ -78,13 +77,11 @@ end
 
 ```lua
 Bot.stateHandlers = {
-    -- Bot picks a random upgrade when in upgrade screen
     upgrade = function(dt, bot)
         local choices = Game.getUpgradeChoices()
         choices[math.random(#choices)].apply()
         Game.nextState()
     end,
-    -- Bot advances to next run on game over
     gameover = function(dt, bot)
         bot.handleRunEnd(dt)
     end,
@@ -94,30 +91,26 @@ Bot.stateHandlers = {
 ### 3. Wire into your update loop
 
 ```lua
--- In your update function (e.g. love.update, or your engine's tick):
-function update(dt)
+function love.update(dt)
     local gameDt = dt * Bot.speed
-    Telemetry.update(gameDt, Game.state == "play")
+    T.update(gameDt, Game.state == "combat")
     Bot.update(gameDt)
-    -- ... your game update logic ...
+    -- ... your game logic ...
 end
 
--- In your key handler:
-function onKeyPressed(key)
+function love.keypressed(key)
     if Bot.keypressed(key) then return end
-    -- ... your input handling ...
+    -- ... your input ...
 end
 
--- In your click/touch handler:
-function onMousePressed(x, y, button)
-    if Bot.enabled then return end  -- ignore human input during bot play
+function love.mousepressed(x, y, button)
+    if Bot.enabled then return end
     -- ... your click handling ...
 end
 
--- In your draw function:
-function draw()
+function love.draw()
     -- ... your game drawing ...
-    Bot.drawHUD()  -- show bot status overlay (delegates to drawFn callback)
+    Bot.drawHUD()
 end
 ```
 
@@ -125,32 +118,70 @@ end
 
 ```lua
 -- Log events from your game code
-Telemetry.log("enemy_killed", { x = e.x, y = e.y, type = e.type })
-Telemetry.log("upgrade_picked", { name = upgrade.name })
+T.log("enemy_killed", { x = e.x, y = e.y, type = e.type })
 
--- Periodic snapshots capture game state automatically
-Telemetry.snapshotFn = function()
+-- Track phases (e.g., combat waves, levels)
+T.beginPhase("wave", { health = player.hp, enemies = 12 })
+-- ... gameplay ...
+T.endPhase("wave", { health = player.hp, enemies = 0 })
+-- Automatically computes: duration, health_delta, enemies_delta
+
+-- Periodic snapshots
+T.snapshotFn = function()
     return { health = player.hp, enemies = #enemies, score = score }
 end
 
--- Summary data included in per-run results
-Telemetry.summaryFn = function()
-    return { finalScore = score, finalLevel = level, finalHealth = player.hp }
+-- Per-run summary
+T.summaryFn = function()
+    return { finalScore = score, finalLevel = level }
 end
 
 -- Call at game over
-Telemetry.endRun()
+T.endRun()
 ```
+
+### 5. Add balance assertions
+
+```lua
+T.addAssertion("medium bot survives past level 3", function(run)
+    return (run.finalLevel or 0) >= 3
+end)
+
+T.addAssertion("score above 50 for most runs", function(run)
+    return (run.finalScore or 0) >= 50
+end, "majority")  -- passes if >50% of runs pass
+```
+
+After all runs complete:
+
+```lua
+print(T.formatBatchStats())
+print(T.formatAssertions())
+local check = T.checkAssertions()
+if not check.passed then os.exit(1) end
+```
+
+## Cursor Movement: Fitts's Law
+
+The bot doesn't move at constant speed. It models human mouse behavior:
+
+- **Fast start**: high acceleration when cursor is far from target
+- **Slow approach**: deceleration as cursor nears target (distance-proportional velocity)
+- **Overshoot**: occasional momentum-based overshoot on arrival, then correction
+- **Jitter**: framerate-independent random perturbation at fixed 30Hz tick rate
+- **Idle drift**: gradual deceleration when no target is available
+
+The responsiveness scales with the skill preset's reaction time -- high-skill bots have snappier cursor response.
 
 ## Engine Integration
 
-The library has **zero hard dependencies**. Three callbacks handle all engine-specific behavior:
+Three callbacks handle all engine-specific behavior:
 
 | Callback | Purpose | Default |
 |---|---|---|
-| `Bot.drawFn` | Draw the HUD overlay | Uses `love.graphics` if available, otherwise no-op |
-| `Bot.quitFn` | Quit the application (CI mode) | Uses `love.event.quit()` if available, otherwise `os.exit(0)` |
-| `Telemetry.writeFn` | Write results to disk | Uses `love.filesystem.write` if available, otherwise `io.open` |
+| `Bot.drawFn` | Draw the HUD overlay | `love.graphics` if available, else no-op |
+| `Bot.quitFn` | Quit the application | `love.event.quit()` if available, else `os.exit(0)` |
+| `T.writeFn` | Write results to disk | `love.filesystem.write` if available, else `io.open` |
 
 ### Defold example
 
@@ -162,41 +193,31 @@ Bot.drawFn = function(bot, x, y, lines)
         })
     end
 end
-
 Bot.quitFn = function() sys.exit(0) end
-
-Telemetry.writeFn = function(filename, contents)
+T.writeFn = function(filename, contents)
     sys.save(sys.get_save_file("myapp", filename), { data = contents })
 end
 ```
 
-### Plain Lua (headless CI)
+### Headless CI (no graphics)
 
 ```lua
--- No drawing needed, file I/O works via io.open by default
-Bot.drawFn = function() end  -- no-op
--- Bot.quitFn defaults to os.exit(0) when love is unavailable
+Bot.drawFn = function() end
+-- quitFn and writeFn default to os.exit / io.open when love is unavailable
 ```
 
 ## CLI Usage
 
-Start bot runs from the command line:
-
 ```bash
-# LOVE2D
-love . bot medium 10 4
-
-# Plain Lua (if your game supports headless mode)
-lua main.lua bot high 5 8
+love . bot medium 10 4    # 10 runs, medium skill, 4x speed
+lua main.lua bot high 5 8 # plain Lua, 5 runs, high skill, 8x speed
 ```
-
-Parse CLI args at startup:
 
 ```lua
 local botArgs = Bot.parseCLI()
 if botArgs then
     Bot.speed = botArgs.speed
-    Bot.autoQuit = true  -- exit when done
+    Bot.autoQuit = true
     Bot.startBatch(botArgs.runs, botArgs.skill)
 end
 ```
@@ -205,12 +226,9 @@ end
 
 | Key | Action |
 |-----|--------|
-| `B` | Toggle bot on/off (starts 5 runs) |
-| `1` | Set skill to low |
-| `2` | Set skill to medium |
-| `3` | Set skill to high |
-| `+` | Double game speed |
-| `-` | Halve game speed |
+| `B` | Toggle bot on/off |
+| `1` / `2` / `3` | Set skill to low / medium / high |
+| `+` / `-` | Double / halve game speed |
 
 ## Skill Presets
 
@@ -220,7 +238,7 @@ end
 | medium | 280ms    | 12px     | 650 px/s   | 220ms      |
 | high   | 100ms    | 4px      | 1100 px/s  | 120ms      |
 
-Add custom presets:
+Custom presets:
 
 ```lua
 Bot.skillParams.superhuman = {
@@ -230,34 +248,47 @@ Bot.skillParams.superhuman = {
 
 ## Telemetry Output
 
-Results are written to `telemetry.lua` (configurable via `T.outputFile`). Each run produces a summary table:
+### Per-run results (Lua table)
 
 ```lua
 return {
   { -- Run 1
     player = "bot_medium",
-    duration = 45.2,
-    totalEvents = 312,
-    finalScore = 47,
+    duration = 142.3,
+    timestamp = 1775619878,
+    totalEvents = 291,
+    finalScore = 123,
     eventCounts = {
-      enemy_killed = 47,
-      miss = 23,
-      snapshot = 90,
-      game_over = 1,
+      snapshot = 220, phase_start = 15, phase_end = 15,
+      upgrade = 14, path = 14, game_over = 1,
+    },
+    phases = {
+      wave = {
+        { duration=13.5, flyCount_delta=-4, freshness_delta=-5.5 },
+        { duration=5.9, flyCount_delta=-5, freshness_delta=3.9 },
+        -- ...
+      },
     },
   },
-  -- ...
 }
 ```
 
-## Example
+### Batch statistics (printed)
 
-See `example/main.lua` for a complete LOVE2D integration with a minimal "click the circles" game.
+```
+Batch Statistics (3 runs):
+  duration              mean=142.22  stddev=16.46  min=128.44  max=165.36
+  finalDay              mean=16.00  stddev=0.00  min=16.00  max=16.00
+  finalScore            mean=123.33  stddev=1.89  min=122.00  max=126.00
+```
 
-```bash
-cd autoplaytest-lua
-love example              # play manually
-love example bot high 5 8 # watch 5 bot runs at 8x speed
+### Balance assertions (printed)
+
+```
+Balance Assertions:
+  [PASS] bot_medium survives past day 3 -- 3/3 passed
+  [PASS] bot_high survives past day 8 -- 3/3 passed
+All assertions passed.
 ```
 
 ## API Reference
@@ -266,42 +297,63 @@ love example bot high 5 8 # watch 5 bot runs at 8x speed
 
 | Field / Method | Description |
 |---|---|
-| `Bot.enabled` | `boolean` — is the bot currently active |
-| `Bot.speed` | `number` — game speed multiplier |
-| `Bot.skill` | `string` — current skill preset name |
-| `Bot.cx, Bot.cy` | `number` — virtual cursor position |
-| `Bot.screenW, Bot.screenH` | `number` — design coordinate bounds |
-| `Bot.findTarget` | `function() -> x, y or nil` — targeting callback |
-| `Bot.onClick` | `function(x, y)` — click dispatch callback |
-| `Bot.getState` | `function() -> string` — game state callback |
-| `Bot.stateHandlers` | `table<string, function(dt, bot)>` — per-state behaviors |
-| `Bot.onRunStart` | `function()` — new run callback |
-| `Bot.onRunEnd` | `function()` — run complete callback |
-| `Bot.drawFn` | `function(bot, x, y, lines)` — engine-specific HUD drawing |
-| `Bot.quitFn` | `function()` — engine-specific quit |
-| `Bot.skillParams` | `table` — skill preset definitions |
+| `Bot.enabled` | `boolean` -- is the bot active |
+| `Bot.speed` | `number` -- game speed multiplier |
+| `Bot.skill` | `string` -- current skill preset name |
+| `Bot.cx, Bot.cy` | `number` -- virtual cursor position |
+| `Bot.vx, Bot.vy` | `number` -- cursor velocity (Fitts's law) |
+| `Bot.screenW, Bot.screenH` | `number` -- design coordinate bounds |
+| `Bot.findTarget` | `function() -> x, y or nil` |
+| `Bot.onClick` | `function(x, y)` |
+| `Bot.getState` | `function() -> string` |
+| `Bot.stateHandlers` | `table<string, function(dt, bot)>` |
+| `Bot.onRunStart` | `function()` |
+| `Bot.onRunEnd` | `function()` |
+| `Bot.drawFn` | `function(bot, x, y, lines)` |
+| `Bot.quitFn` | `function()` |
+| `Bot.skillParams` | `table` -- skill preset definitions |
 | `Bot.update(dt)` | Call from your update loop |
-| `Bot.keypressed(key)` | Call from your key handler, returns `true` if consumed |
-| `Bot.drawHUD(x, y, extraLines)` | Draw status overlay (delegates to drawFn) |
+| `Bot.keypressed(key) -> bool` | Call from key handler |
+| `Bot.drawHUD(x, y, extraLines)` | Draw status overlay |
 | `Bot.startBatch(runs, skill)` | Start N automated runs |
-| `Bot.handleRunEnd(dt)` | Advance to next run (call from gameover handler) |
-| `Bot.parseCLI(args)` | Parse command-line bot arguments |
+| `Bot.handleRunEnd(dt)` | Advance to next run |
+| `Bot.parseCLI(args)` | Parse CLI arguments |
+| `Bot.quit()` | Quit application |
 
 ### Telemetry
 
 | Field / Method | Description |
 |---|---|
-| `Telemetry.playerTag` | `string` — identifies the player ("human", "bot_medium") |
-| `Telemetry.outputFile` | `string` — filename for results (default: "telemetry.lua") |
-| `Telemetry.snapshotInterval` | `number` — seconds between snapshots (default: 0.5) |
-| `Telemetry.snapshotFn` | `function() -> table` — snapshot data callback |
-| `Telemetry.summaryFn` | `function() -> table` — summary data callback |
-| `Telemetry.writeFn` | `function(filename, contents)` — engine-specific file write |
-| `Telemetry.reset()` | Clear events for a new run |
-| `Telemetry.log(type, data)` | Log a named event |
-| `Telemetry.update(dt, isPlaying)` | Call from your update loop for periodic snapshots |
-| `Telemetry.endRun()` | Compute summary and save results |
-| `Telemetry.runResults` | `table` — all accumulated run summaries |
+| `T.playerTag` | `string` -- player identifier |
+| `T.outputFile` | `string` -- results filename (default: "telemetry.lua") |
+| `T.snapshotInterval` | `number` -- seconds between snapshots (default: 0.5) |
+| `T.snapshotFn` | `function() -> table` |
+| `T.summaryFn` | `function() -> table` |
+| `T.writeFn` | `function(filename, contents)` |
+| `T.reset()` | Clear events for a new run |
+| `T.log(type, data)` | Log a named event |
+| `T.update(dt, isPlaying)` | Advance time + periodic snapshots |
+| `T.beginPhase(name, startData)` | Begin a named phase |
+| `T.endPhase(name, endData)` | End phase, compute duration + deltas |
+| `T.inPhase(name) -> bool` | Check if phase is active |
+| `T.query(type, filterFn) -> events` | Find events by type |
+| `T.count(type, filterFn) -> number` | Count events by type |
+| `T.endRun()` | Compute summary and save |
+| `T.batchStats() -> table` | Aggregate stats across runs |
+| `T.formatBatchStats() -> string` | Pretty-print batch stats |
+| `T.addAssertion(name, fn, mode)` | Register a balance assertion |
+| `T.checkAssertions() -> table` | Run all assertions |
+| `T.formatAssertions() -> string` | Pretty-print assertion results |
+| `T.runResults` | `table` -- all run summaries |
+
+## Example
+
+See `example/bot_apt.lua` for a real-world integration with a LOVE2D roguelike game, demonstrating:
+- Targeting (closest enemy to cursor)
+- Strategy (heal when low, fight otherwise)
+- Phase tracking (per-wave stats)
+- Balance assertions
+- Batch statistics output
 
 ## License
 

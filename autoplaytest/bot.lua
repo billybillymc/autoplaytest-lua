@@ -1,13 +1,10 @@
--- autoplaytest/bot.lua — Generic AI player framework for automated playtesting
+-- autoplaytest/bot.lua — AI player framework for automated playtesting
 --
--- Engine-agnostic. Simulates a human player with configurable skill levels
--- (reaction time, accuracy, move speed, click rate). Drives a virtual cursor
--- and dispatches clicks into your game. You register per-state behavior
--- handlers and a target-finding function; the bot handles cursor movement,
--- jitter, and batch run management.
+-- Engine-agnostic. Simulates a human player with configurable skill levels.
+-- Drives a virtual cursor with Fitts's law movement (acceleration,
+-- deceleration, overshoot) and framerate-independent jitter.
 --
--- The only engine-specific bits are drawHUD() and quit behavior — override
--- Bot.drawFn and Bot.quitFn to wire into your engine.
+-- Override Bot.drawFn and Bot.quitFn for your engine.
 
 local Bot = {}
 
@@ -18,17 +15,26 @@ Bot.runsTotal = 5
 Bot.runsLeft = 0
 Bot.runIndex = 0
 Bot.restartTimer = 0
-Bot.autoQuit = false -- quit application after all runs complete (for CI)
+Bot.autoQuit = false
 
 -- Virtual cursor position (design/world coordinates)
 Bot.cx = 0
 Bot.cy = 0
+
+-- Cursor velocity for Fitts's law movement
+Bot.vx = 0
+Bot.vy = 0
 
 -- Internal targeting state
 Bot.targetX = nil
 Bot.targetY = nil
 Bot.clickCooldown = 0
 Bot.scanTimer = 0
+Bot.jitterAccum = 0  -- accumulated time for framerate-independent jitter
+
+-- Overshoot state
+Bot.overshooting = false
+Bot.overshootTimer = 0
 
 -- Skill presets: reaction (seconds), accuracy (pixels of jitter),
 -- moveSpeed (pixels/sec), clickRate (seconds between clicks)
@@ -42,38 +48,29 @@ Bot.skillParams = {
 -- USER-SUPPLIED CALLBACKS
 ------------------------------------------------------
 
---- Called to find what the bot should click on during active gameplay.
--- Must return (x, y) in design/world coords, or nil if nothing to target.
+--- Must return (x, y) of what to click, or nil.
 Bot.findTarget = nil
 
---- Called when the bot clicks at (x, y) during active gameplay.
--- Wire this into your game's input handler.
+--- Called when the bot clicks at (x, y).
 Bot.onClick = nil
 
---- Table of state handlers: keys are game state names, values are functions.
--- Each function receives (dt, bot) and should drive the game forward.
--- The "play" state is handled internally (cursor movement + clicking).
+--- Table of state handlers: { stateName = function(dt, bot) }
+--- "play" is handled internally (cursor movement + clicking).
 Bot.stateHandlers = {}
 
---- Called to get the current game state name (string).
--- Must return one of the keys in stateHandlers, or "play" for active gameplay.
+--- Must return current game state name (string).
 Bot.getState = nil
 
---- Called when a new run starts. Should reset the game to a playable state.
+--- Called when a new run starts. Reset game here.
 Bot.onRunStart = nil
 
---- Called when a run ends normally (not a restart). Optional.
+--- Called when a run ends. Optional.
 Bot.onRunEnd = nil
 
---- Engine-specific: called to draw the HUD overlay.
--- Signature: function(bot, x, y, lines)
--- where lines is an array of strings to display.
--- Set this to your engine's text drawing implementation.
--- A LOVE2D default is provided if love.graphics is available.
+--- Engine-specific draw. Signature: function(bot, x, y, lines)
 Bot.drawFn = nil
 
---- Engine-specific: called to quit the application (for autoQuit/CI mode).
--- Default: calls love.event.quit() if available, otherwise os.exit(0).
+--- Engine-specific quit. Default: love.event.quit() or os.exit(0).
 Bot.quitFn = nil
 
 --- Screen dimensions for cursor clamping (design coordinates).
@@ -97,7 +94,92 @@ function Bot.update(dt)
 end
 
 ------------------------------------------------------
--- ACTIVE GAMEPLAY (cursor movement + clicking)
+-- FITTS'S LAW CURSOR MOVEMENT
+------------------------------------------------------
+-- Humans move fast toward distant targets and slow down as they approach.
+-- Modeled as: high acceleration at distance, strong deceleration near target,
+-- with occasional overshoot on arrival.
+--
+-- The key insight: movement time = a + b * log2(distance/targetSize + 1)
+-- We approximate this with a velocity model:
+--   - Acceleration proportional to distance (far = fast start)
+--   - Deceleration ramps up as cursor nears target
+--   - Velocity is damped, not teleported, so there's natural overshoot
+
+local function fittsMove(bot, dx, dy, dist, p, dt)
+    local maxSpeed = p.moveSpeed
+
+    -- Acceleration factor: stronger when far, weaker when close
+    -- This creates the characteristic fast-start, slow-finish curve
+    local accelZone = 200  -- pixels: distance at which we're at full accel
+    local distFactor = math.min(1.0, dist / accelZone)
+
+    -- Target velocity: high when far, low when close
+    local targetSpeed = maxSpeed * distFactor
+
+    -- Direction toward target
+    local nx, ny = 0, 0
+    if dist > 0.1 then
+        nx, ny = dx / dist, dy / dist
+    end
+
+    -- Target velocity vector
+    local tvx = nx * targetSpeed
+    local tvy = ny * targetSpeed
+
+    -- Smoothly blend current velocity toward target velocity
+    -- Higher smoothing = more sluggish (lower skill = more sluggish)
+    local responsiveness = 8 + (1 - p.reaction) * 12  -- faster reaction = snappier
+    local blend = 1 - math.exp(-responsiveness * dt)
+    bot.vx = bot.vx + (tvx - bot.vx) * blend
+    bot.vy = bot.vy + (tvy - bot.vy) * blend
+
+    -- Apply velocity
+    bot.cx = bot.cx + bot.vx * dt
+    bot.cy = bot.cy + bot.vy * dt
+
+    -- Overshoot: when arriving at target, sometimes overshoot and correct
+    if dist < p.accuracy * 2 and not bot.overshooting then
+        local speed = math.sqrt(bot.vx * bot.vx + bot.vy * bot.vy)
+        -- Overshoot chance scales with speed and inverse skill
+        if speed > maxSpeed * 0.3 and math.random() < p.accuracy / 40 then
+            bot.overshooting = true
+            bot.overshootTimer = 0.05 + math.random() * 0.08
+            -- Add momentum burst in current direction
+            local overshootMag = p.accuracy * (0.5 + math.random() * 0.5)
+            bot.vx = bot.vx + nx * overshootMag / dt * 0.02
+            bot.vy = bot.vy + ny * overshootMag / dt * 0.02
+        end
+    end
+
+    if bot.overshooting then
+        bot.overshootTimer = bot.overshootTimer - dt
+        if bot.overshootTimer <= 0 then
+            bot.overshooting = false
+        end
+    end
+end
+
+------------------------------------------------------
+-- FRAMERATE-INDEPENDENT JITTER
+------------------------------------------------------
+-- Instead of applying jitter every frame, we accumulate time and apply
+-- jitter at a fixed rate (~30 times/sec). This ensures consistent
+-- behavior regardless of framerate.
+
+local JITTER_INTERVAL = 1 / 30  -- apply jitter 30 times per second
+
+local function applyJitter(bot, p, dt)
+    bot.jitterAccum = bot.jitterAccum + dt
+    while bot.jitterAccum >= JITTER_INTERVAL do
+        bot.jitterAccum = bot.jitterAccum - JITTER_INTERVAL
+        bot.cx = bot.cx + (math.random() - 0.5) * p.accuracy * 0.3
+        bot.cy = bot.cy + (math.random() - 0.5) * p.accuracy * 0.3
+    end
+end
+
+------------------------------------------------------
+-- ACTIVE GAMEPLAY
 ------------------------------------------------------
 
 function Bot.playUpdate(dt)
@@ -115,27 +197,25 @@ function Bot.playUpdate(dt)
         end
     end
 
-    if not Bot.targetX then return end
+    if not Bot.targetX then
+        -- Idle: gradually decelerate
+        Bot.vx = Bot.vx * (1 - 3 * dt)
+        Bot.vy = Bot.vy * (1 - 3 * dt)
+        Bot.cx = Bot.cx + Bot.vx * dt
+        Bot.cy = Bot.cy + Bot.vy * dt
+        applyJitter(Bot, p, dt)
+        Bot.clampCursor()
+        return
+    end
 
-    -- Move virtual cursor toward target
+    -- Move toward target using Fitts's law
     local dx = Bot.targetX - Bot.cx
     local dy = Bot.targetY - Bot.cy
     local dist = math.sqrt(dx * dx + dy * dy)
 
-    if dist > 2 then
-        local move = p.moveSpeed * dt
-        if move > dist then move = dist end
-        Bot.cx = Bot.cx + (dx / dist) * move
-        Bot.cy = Bot.cy + (dy / dist) * move
-    end
-
-    -- Simulate imprecise mouse control (jitter)
-    Bot.cx = Bot.cx + (math.random() - 0.5) * p.accuracy * 0.3
-    Bot.cy = Bot.cy + (math.random() - 0.5) * p.accuracy * 0.3
-
-    -- Clamp to screen bounds
-    Bot.cx = math.max(10, math.min(Bot.screenW - 10, Bot.cx))
-    Bot.cy = math.max(10, math.min(Bot.screenH - 10, Bot.cy))
+    fittsMove(Bot, dx, dy, dist, p, dt)
+    applyJitter(Bot, p, dt)
+    Bot.clampCursor()
 
     -- Click when close enough
     local clickDist = p.accuracy * 1.5
@@ -150,13 +230,15 @@ function Bot.playUpdate(dt)
     end
 end
 
+function Bot.clampCursor()
+    Bot.cx = math.max(10, math.min(Bot.screenW - 10, Bot.cx))
+    Bot.cy = math.max(10, math.min(Bot.screenH - 10, Bot.cy))
+end
+
 ------------------------------------------------------
 -- BATCH RUN MANAGEMENT
 ------------------------------------------------------
 
---- Start a batch of automated runs.
--- @param numRuns number  how many games to play
--- @param skill string|nil  "low", "medium", or "high" (default: current)
 function Bot.startBatch(numRuns, skill)
     Bot.skill = skill or Bot.skill
     Bot.runsTotal = numRuns
@@ -167,19 +249,21 @@ function Bot.startBatch(numRuns, skill)
     Bot.beginRun()
 end
 
---- Called internally to start a single run.
 function Bot.beginRun()
     Bot.cx = Bot.screenW / 2
     Bot.cy = Bot.screenH / 2
+    Bot.vx = 0
+    Bot.vy = 0
     Bot.targetX = nil
     Bot.targetY = nil
     Bot.clickCooldown = 0
     Bot.scanTimer = 0
+    Bot.jitterAccum = 0
+    Bot.overshooting = false
+    Bot.overshootTimer = 0
     if Bot.onRunStart then Bot.onRunStart() end
 end
 
---- Call this from your game-over handler to advance to the next run.
--- @param dt number  delta time (used for a brief pause between runs)
 function Bot.handleRunEnd(dt)
     Bot.restartTimer = Bot.restartTimer + dt
     if Bot.restartTimer < 0.3 then return end
@@ -193,9 +277,7 @@ function Bot.handleRunEnd(dt)
         Bot.beginRun()
     else
         Bot.enabled = false
-        if Bot.autoQuit then
-            Bot.quit()
-        end
+        if Bot.autoQuit then Bot.quit() end
     end
 end
 
@@ -203,7 +285,6 @@ end
 -- ENGINE INTEGRATION (overridable)
 ------------------------------------------------------
 
---- Quit the application. Override Bot.quitFn for custom behavior.
 function Bot.quit()
     if Bot.quitFn then
         Bot.quitFn()
@@ -214,10 +295,6 @@ function Bot.quit()
     end
 end
 
---- Draw a small status overlay. Override Bot.drawFn for non-LOVE2D engines.
--- @param x number|nil  top-left X (default: screenW - 170)
--- @param y number|nil  top-left Y (default: 0)
--- @param extraLines table|nil  additional strings to display
 function Bot.drawHUD(x, y, extraLines)
     if not Bot.enabled then return end
 
@@ -240,7 +317,7 @@ function Bot.drawHUD(x, y, extraLines)
         return
     end
 
-    -- Default LOVE2D implementation (no-op if love.graphics is unavailable)
+    -- Default LOVE2D fallback
     if not (love and love.graphics) then return end
 
     local lineH = 14
@@ -259,9 +336,6 @@ end
 -- CLI ARGUMENT PARSING
 ------------------------------------------------------
 
---- Parse command-line arguments for bot configuration.
--- Usage: yourapp bot [skill] [runs] [speed]
--- e.g.:  love . bot medium 10 4
 function Bot.parseCLI(args)
     args = args or arg or {}
     for i = 1, #args do
@@ -279,12 +353,6 @@ end
 -- KEYBOARD CONTROLS
 ------------------------------------------------------
 
---- Provides default hotkeys. Call from your engine's key handler.
---   b     = toggle bot on/off
---   1/2/3 = set skill to low/medium/high
---   +/-   = double/halve speed
--- @param key string  the key name
--- @return boolean  true if the key was consumed
 function Bot.keypressed(key)
     if key == "b" then
         if Bot.enabled then

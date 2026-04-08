@@ -1,35 +1,29 @@
--- autoplaytest/telemetry.lua — Game event logging, snapshots, and run summary export
+-- autoplaytest/telemetry.lua — Event logging, phase tracking, batch stats, assertions
 --
--- Engine-agnostic telemetry system for automated playtesting.
--- Hook into your game events via T.log() and the provided callbacks,
--- then call T.endRun() at game over to accumulate per-run summaries.
---
--- File output uses T.writeFn — override it for your engine/environment.
--- A default using love.filesystem is provided if available, with an
--- io.open fallback for plain Lua.
+-- Engine-agnostic. Override T.writeFn for your engine.
 
 local T = {}
 
 T.events = {}
 T.gameTime = 0
-T.snapshotInterval = 0.5  -- seconds between periodic snapshots
+T.snapshotInterval = 0.5
 T.snapshotTimer = 0
 T.runResults = {}
-T.playerTag = "human"     -- "human", "bot_low", "bot_medium", etc.
+T.playerTag = "human"
 T.outputFile = "telemetry.lua"
 
--- User-supplied function: returns a table of game state for snapshots.
--- e.g. function() return { health = player.hp, enemies = #enemies } end
-T.snapshotFn = nil
+-- Active phases: { phaseName = { startTime, startData } }
+T.phases = {}
 
--- User-supplied function: returns a table of state to include in the summary.
--- Called at endRun. e.g. function() return { finalScore = score, level = level } end
-T.summaryFn = nil
+-- User callbacks
+T.snapshotFn = nil   -- function() -> table of state to snapshot
+T.summaryFn = nil    -- function() -> table of extra fields for run summary
+T.writeFn = nil      -- function(filename, contents)
 
---- Engine-specific: called to write results to disk.
--- Signature: function(filename, contents)
--- Default: uses love.filesystem.write if available, otherwise io.open.
-T.writeFn = nil
+-- Assertions: { { name, fn, mode } }
+-- fn receives (runSummary) and returns true/false
+-- mode: "every" (must pass every run) or "majority" (>50% of runs)
+T.assertions = {}
 
 ------------------------------------------------------
 -- CORE API
@@ -39,11 +33,10 @@ function T.reset()
     T.events = {}
     T.gameTime = 0
     T.snapshotTimer = 0
+    T.phases = {}
 end
 
 --- Log a named event with optional data.
--- @param eventType string  e.g. "wave_start", "enemy_killed", "upgrade_picked"
--- @param data table|nil    arbitrary key/value pairs merged into the event
 function T.log(eventType, data)
     local event = { t = T.gameTime, type = eventType }
     if data then
@@ -53,12 +46,68 @@ function T.log(eventType, data)
 end
 
 ------------------------------------------------------
+-- PHASE TRACKING
+------------------------------------------------------
+-- Generic begin/end phase pairs. Automatically computes duration
+-- and diffs any numeric fields between start and end snapshots.
+--
+-- Usage:
+--   T.beginPhase("wave", { day = 5, freshness = 80, flies = 12 })
+--   ... gameplay ...
+--   T.endPhase("wave", { freshness = 55, flies = 0 })
+--   -- logged event includes: duration, freshness_delta = -25, flies_delta = -12
+
+--- Begin a named phase. startData is an optional table of numeric state.
+function T.beginPhase(name, startData)
+    T.phases[name] = {
+        startTime = T.gameTime,
+        startData = startData or {},
+    }
+    local logData = { phase = name }
+    if startData then
+        for k, v in pairs(startData) do logData[k] = v end
+    end
+    T.log("phase_start", logData)
+end
+
+--- End a named phase. endData is an optional table of numeric state.
+--- Automatically computes duration and deltas for matching numeric keys.
+function T.endPhase(name, endData)
+    local phase = T.phases[name]
+    if not phase then return end
+
+    local duration = T.gameTime - phase.startTime
+    local logData = {
+        phase = name,
+        duration = duration,
+    }
+
+    endData = endData or {}
+    -- Copy end data
+    for k, v in pairs(endData) do
+        logData[k] = v
+    end
+
+    -- Compute deltas for numeric fields present in both start and end
+    for k, startVal in pairs(phase.startData) do
+        if type(startVal) == "number" and type(endData[k]) == "number" then
+            logData[k .. "_delta"] = endData[k] - startVal
+        end
+    end
+
+    T.log("phase_end", logData)
+    T.phases[name] = nil
+end
+
+--- Check if a phase is currently active.
+function T.inPhase(name)
+    return T.phases[name] ~= nil
+end
+
+------------------------------------------------------
 -- PERIODIC SNAPSHOTS
 ------------------------------------------------------
 
---- Call from your update loop. Logs periodic snapshots during play.
--- @param dt number  delta time (already scaled by bot speed if applicable)
--- @param isPlaying boolean|nil  only snapshot when true (default: true)
 function T.update(dt, isPlaying)
     T.gameTime = T.gameTime + dt
     if isPlaying == false then return end
@@ -77,23 +126,73 @@ function T.update(dt, isPlaying)
 end
 
 ------------------------------------------------------
+-- EVENT QUERIES
+------------------------------------------------------
+
+--- Return all events matching a type and optional filter function.
+function T.query(eventType, filterFn)
+    local results = {}
+    for _, e in ipairs(T.events) do
+        if e.type == eventType then
+            if not filterFn or filterFn(e) then
+                results[#results + 1] = e
+            end
+        end
+    end
+    return results
+end
+
+--- Count events matching a type and optional filter.
+function T.count(eventType, filterFn)
+    local n = 0
+    for _, e in ipairs(T.events) do
+        if e.type == eventType then
+            if not filterFn or filterFn(e) then
+                n = n + 1
+            end
+        end
+    end
+    return n
+end
+
+------------------------------------------------------
 -- RUN LIFECYCLE
 ------------------------------------------------------
 
---- Call when a playtest run ends (game over, victory, etc.).
--- Computes a summary from logged events + summaryFn, appends to runResults, and saves.
 function T.endRun()
     local summary = T.computeSummary()
     T.runResults[#T.runResults + 1] = summary
     T.saveResults()
 end
 
---- Compute a summary of the current run's events.
--- Counts events by type and merges user-supplied summary data.
 function T.computeSummary()
     local counts = {}
     for _, e in ipairs(T.events) do
         counts[e.type] = (counts[e.type] or 0) + 1
+    end
+
+    -- Gather phase summaries
+    local phaseSummaries = {}
+    local currentPhases = {}
+    for _, e in ipairs(T.events) do
+        if e.type == "phase_start" then
+            currentPhases[e.phase] = e
+        elseif e.type == "phase_end" and currentPhases[e.phase] then
+            if not phaseSummaries[e.phase] then
+                phaseSummaries[e.phase] = {}
+            end
+            local ps = phaseSummaries[e.phase]
+            ps[#ps + 1] = {
+                duration = e.duration,
+            }
+            -- Include all delta fields
+            for k, v in pairs(e) do
+                if type(v) == "number" and k:match("_delta$") then
+                    ps[#ps][k] = v
+                end
+            end
+            currentPhases[e.phase] = nil
+        end
     end
 
     local summary = {
@@ -101,9 +200,10 @@ function T.computeSummary()
         duration = T.gameTime,
         eventCounts = counts,
         totalEvents = #T.events,
+        phases = phaseSummaries,
+        timestamp = os.time(),
     }
 
-    -- Merge user-supplied summary fields
     if T.summaryFn then
         local extra = T.summaryFn()
         if extra then
@@ -115,17 +215,163 @@ function T.computeSummary()
 end
 
 ------------------------------------------------------
+-- BATCH STATISTICS
+------------------------------------------------------
+-- Compute aggregate stats across all runs in a batch.
+-- Finds all numeric fields in run summaries and computes
+-- mean, stddev, min, max for each.
+
+function T.batchStats()
+    if #T.runResults == 0 then return {} end
+
+    -- Collect all numeric fields across runs
+    local fields = {}
+    for _, run in ipairs(T.runResults) do
+        for k, v in pairs(run) do
+            if type(v) == "number" and k ~= "timestamp" then
+                if not fields[k] then fields[k] = {} end
+                fields[k][#fields[k] + 1] = v
+            end
+        end
+    end
+
+    local stats = { n = #T.runResults }
+    for field, values in pairs(fields) do
+        local sum = 0
+        local min, max = math.huge, -math.huge
+        for _, v in ipairs(values) do
+            sum = sum + v
+            if v < min then min = v end
+            if v > max then max = v end
+        end
+        local mean = sum / #values
+        local variance = 0
+        for _, v in ipairs(values) do
+            variance = variance + (v - mean) ^ 2
+        end
+        variance = variance / #values
+        stats[field] = {
+            mean = mean,
+            stddev = math.sqrt(variance),
+            min = min,
+            max = max,
+            n = #values,
+        }
+    end
+    return stats
+end
+
+--- Pretty-print batch stats to a string.
+function T.formatBatchStats()
+    local stats = T.batchStats()
+    if not stats.n then return "No runs recorded." end
+
+    local lines = { "Batch Statistics (" .. stats.n .. " runs):" }
+    local keys = {}
+    for k, v in pairs(stats) do
+        if type(v) == "table" then keys[#keys + 1] = k end
+    end
+    table.sort(keys)
+
+    for _, k in ipairs(keys) do
+        local s = stats[k]
+        lines[#lines + 1] = string.format(
+            "  %-20s  mean=%.2f  stddev=%.2f  min=%.2f  max=%.2f",
+            k, s.mean, s.stddev, s.min, s.max
+        )
+    end
+    return table.concat(lines, "\n")
+end
+
+------------------------------------------------------
+-- BALANCE ASSERTIONS
+------------------------------------------------------
+
+--- Register a balance assertion.
+-- @param name string  descriptive name for the assertion
+-- @param fn function(runSummary) -> boolean  must return true to pass
+-- @param mode string  "every" (default) or "majority"
+function T.addAssertion(name, fn, mode)
+    T.assertions[#T.assertions + 1] = {
+        name = name,
+        fn = fn,
+        mode = mode or "every",
+    }
+end
+
+--- Run all assertions against accumulated run results.
+--- Returns { passed = bool, results = { {name, passed, detail} } }
+function T.checkAssertions()
+    local results = {}
+    local allPassed = true
+
+    for _, assertion in ipairs(T.assertions) do
+        local passCount = 0
+        local failCount = 0
+        local failDetails = {}
+
+        for i, run in ipairs(T.runResults) do
+            local ok = assertion.fn(run)
+            if ok then
+                passCount = passCount + 1
+            else
+                failCount = failCount + 1
+                failDetails[#failDetails + 1] = i
+            end
+        end
+
+        local passed
+        if assertion.mode == "majority" then
+            passed = passCount > failCount
+        else -- "every"
+            passed = failCount == 0
+        end
+
+        if not passed then allPassed = false end
+
+        results[#results + 1] = {
+            name = assertion.name,
+            passed = passed,
+            passCount = passCount,
+            failCount = failCount,
+            failRuns = failDetails,
+            mode = assertion.mode,
+        }
+    end
+
+    return { passed = allPassed, results = results }
+end
+
+--- Format assertion results as a readable string.
+function T.formatAssertions()
+    local check = T.checkAssertions()
+    if #check.results == 0 then return "No assertions defined." end
+
+    local lines = { "Balance Assertions:" }
+    for _, r in ipairs(check.results) do
+        local status = r.passed and "PASS" or "FAIL"
+        local detail = string.format("%d/%d passed", r.passCount, r.passCount + r.failCount)
+        if r.mode == "majority" then detail = detail .. " (majority)" end
+        lines[#lines + 1] = string.format("  [%s] %s — %s", status, r.name, detail)
+        if not r.passed and #r.failRuns > 0 then
+            local failStr = {}
+            for _, ri in ipairs(r.failRuns) do failStr[#failStr + 1] = tostring(ri) end
+            lines[#lines + 1] = "         Failed runs: " .. table.concat(failStr, ", ")
+        end
+    end
+    lines[#lines + 1] = check.passed and "All assertions passed." or "SOME ASSERTIONS FAILED."
+    return table.concat(lines, "\n")
+end
+
+------------------------------------------------------
 -- EXPORT
 ------------------------------------------------------
 
---- Write a string to a file. Override T.writeFn for custom behavior.
 function T.writeFile(filename, contents)
     if T.writeFn then
         T.writeFn(filename, contents)
         return
     end
-
-    -- Default: try love.filesystem first, fall back to io.open
     if love and love.filesystem and love.filesystem.write then
         love.filesystem.write(filename, contents)
     else
@@ -137,7 +383,6 @@ function T.writeFile(filename, contents)
     end
 end
 
---- Serialize and write all run results.
 function T.saveResults()
     local lines = {}
     local function w(s) lines[#lines + 1] = s end
@@ -146,7 +391,7 @@ function T.saveResults()
     for i, run in ipairs(T.runResults) do
         w("  { -- Run " .. i)
         for k, v in pairs(run) do
-            if k ~= "eventCounts" then
+            if k ~= "eventCounts" and k ~= "phases" then
                 w("    " .. k .. " = " .. T.serialize(v) .. ",")
             end
         end
@@ -157,6 +402,21 @@ function T.saveResults()
             end
             w("    },")
         end
+        if run.phases then
+            w("    phases = {")
+            for pname, plist in pairs(run.phases) do
+                w("      " .. pname .. " = {")
+                for _, p in ipairs(plist) do
+                    local parts = {}
+                    for pk, pv in pairs(p) do
+                        parts[#parts + 1] = pk .. "=" .. T.serialize(pv)
+                    end
+                    w("        { " .. table.concat(parts, ", ") .. " },")
+                end
+                w("      },")
+            end
+            w("    },")
+        end
         w("  },")
     end
     w("}")
@@ -164,7 +424,6 @@ function T.saveResults()
     T.writeFile(T.outputFile, table.concat(lines, "\n") .. "\n")
 end
 
---- Basic value serializer for Lua literals.
 function T.serialize(v)
     local t = type(v)
     if t == "string" then
@@ -173,11 +432,9 @@ function T.serialize(v)
         return tostring(v)
     elseif t == "table" then
         local parts = {}
-        -- Array part
         for i, item in ipairs(v) do
             parts[#parts + 1] = T.serialize(item)
         end
-        -- Hash part (skip integer keys already covered)
         local maxn = #v
         for k, val in pairs(v) do
             if type(k) ~= "number" or k < 1 or k > maxn or k ~= math.floor(k) then
